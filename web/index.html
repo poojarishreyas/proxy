@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>shrey · trajectory</title>
+  <meta name="color-scheme" content="dark" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='9' fill='%23050505'/><circle cx='16' cy='16' r='6.5' fill='none' stroke='%236ee7b7' stroke-width='1.5'/><circle cx='16' cy='16' r='2' fill='%23a5b4fc'/></svg>" />
+  <!-- Progressive enhancement: offline, the system stacks in styles.css take over. -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@300..700&family=Geist+Mono:wght@400;500&display=swap" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="ambient" aria-hidden="true"><i class="orb orb-a"></i><i class="orb orb-b"></i></div>
+
+  <!-- Floating island: detached from the edge, glass only here. -->
+  <header class="island" id="island">
+    <div class="island-inner">
+      <button class="burger" id="burger" aria-label="Sessions" aria-expanded="false" aria-controls="drawer">
+        <span></span><span></span>
+      </button>
+      <a class="brand" href="./" aria-label="shrey">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+          <circle cx="12" cy="12" r="8.25" fill="none" stroke="currentColor" stroke-width="1.25" />
+          <circle cx="12" cy="12" r="2.25" fill="currentColor" />
+          <path d="M3.75 12h3.5M16.75 12h3.5" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" />
+        </svg>
+        <span>shrey</span>
+      </a>
+      <span class="chip" id="live-chip"><i id="live-dot" class="dot"></i><span id="live-text">connecting</span></span>
+      <span class="chip wide mono" id="proxy-pill">proxy —</span>
+      <button class="chip wide mono chip-btn" id="archive-pill" title="Where captures are pushed">archive —</button>
+      <span class="grow"></span>
+      <button class="cta ghost" id="btn-follow" aria-pressed="true" title="Stay pinned to the newest events">
+        <span class="cta-label">Follow</span>
+        <span class="cta-icon">
+          <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M8 3v9.5M4 9l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+      </button>
+      <button class="icon-btn" id="btn-settings" aria-label="Settings" title="Settings">
+        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2.5 4.5h6M11.5 4.5h2M2.5 11.5h2M7.5 11.5h6" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/><circle cx="10" cy="4.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.25"/><circle cx="6" cy="11.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.25"/></svg>
+      </button>
+      <button class="cta" id="btn-flush" title="Commit and push captures now">
+        <span class="cta-label">Push now</span>
+        <span class="cta-icon">
+          <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M4.5 11.5l7-7M6 4.5h5.5V10" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+      </button>
+    </div>
+  </header>
+
+  <!-- Mobile session drawer: full-screen glass, staggered reveal. -->
+  <div class="drawer" id="drawer" aria-hidden="true">
+    <div class="drawer-inner">
+      <span class="eyebrow">Sessions</span>
+      <div class="drawer-list" id="drawer-list"></div>
+    </div>
+  </div>
+
+  <!-- Settings: where captures are pushed. -->
+  <div class="modal" id="settings" hidden role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="modal-scrim" data-close></div>
+    <div class="shell modal-shell">
+      <div class="core modal-core">
+        <div class="pane-head">
+          <div class="title-block">
+            <span class="eyebrow">Settings</span>
+            <h2 class="modal-title" id="settings-title">Where captures go</h2>
+          </div>
+          <button class="icon-btn" data-close aria-label="Close settings">
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/></svg>
+          </button>
+        </div>
+        <div class="modal-body">
+          <p class="hint">Every capture is committed locally, then pushed to this repository. Captures include your prompts, code and tool output; API keys are redacted. Use a private repository.</p>
+          <label class="form-label" for="gh-url">GitHub repository</label>
+          <label class="field big">
+            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path d="M8 1.75a6.25 6.25 0 0 0-1.98 12.18c.31.06.43-.14.43-.3v-1.1c-1.74.38-2.1-.84-2.1-.84-.29-.72-.7-.92-.7-.92-.57-.39.04-.38.04-.38.63.04.96.65.96.65.56.96 1.47.68 1.83.52.06-.4.22-.68.4-.84-1.39-.16-2.85-.7-2.85-3.09 0-.68.24-1.24.64-1.68-.06-.16-.28-.8.06-1.66 0 0 .52-.17 1.72.64a5.9 5.9 0 0 1 3.12 0c1.2-.81 1.72-.64 1.72-.64.34.86.13 1.5.06 1.66.4.44.64 1 .64 1.68 0 2.4-1.46 2.93-2.86 3.08.23.2.43.58.43 1.17v1.73c0 .17.11.37.43.3A6.25 6.25 0 0 0 8 1.75z" fill="none" stroke="currentColor" stroke-width="1" stroke-linejoin="round"/></svg>
+            <input id="gh-url" type="text" placeholder="https://github.com/you/claude-traces" autocomplete="off" spellcheck="false" />
+          </label>
+          <p class="field-msg" id="gh-msg" role="status"></p>
+          <div class="modal-actions">
+            <button class="cta" id="gh-save">
+              <span class="cta-label">Save &amp; push</span>
+              <span class="cta-icon"><svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M4.5 11.5l7-7M6 4.5h5.5V10" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+            </button>
+            <button class="cta ghost" id="gh-auto" hidden>
+              <span class="cta-label">Create a private repo for me</span>
+              <span class="cta-icon"><svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M8 3.5v9M3.5 8h9" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/></svg></span>
+            </button>
+            <button class="text-btn" id="gh-off">Keep local only</button>
+          </div>
+          <div class="section-label">Archive</div>
+          <dl class="kv" id="gh-status"></dl>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="stage" id="stage">
+    <div class="panes" id="panes">
+      <!-- Sessions -->
+      <aside class="shell rise" style="--i:0" aria-label="Sessions">
+        <div class="core sessions">
+          <div class="pane-head">
+            <span class="eyebrow">Sessions</span>
+            <span class="count mono" id="session-count">0</span>
+          </div>
+          <label class="field">
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><circle cx="7" cy="7" r="4.25" fill="none" stroke="currentColor" stroke-width="1.25"/><path d="M10.25 10.25L13 13" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/></svg>
+            <input type="search" id="session-filter" placeholder="Filter sessions" autocomplete="off" />
+          </label>
+          <div class="list" id="session-list"></div>
+          <div class="foot mono" id="session-foot">—</div>
+        </div>
+      </aside>
+
+      <!-- Trace -->
+      <main class="shell rise" style="--i:1" aria-label="Trajectory">
+        <div class="core trace">
+          <div class="trace-head">
+            <div class="title-block">
+              <span class="eyebrow id" id="sb-eyebrow">Trajectory</span>
+              <h1 class="name" id="sb-title">No session selected</h1>
+            </div>
+            <div class="head-meta">
+              <span class="chip mono model-chip" id="sb-model">—</span>
+              <label class="field compact">
+                <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><circle cx="7" cy="7" r="4.25" fill="none" stroke="currentColor" stroke-width="1.25"/><path d="M10.25 10.25L13 13" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/></svg>
+                <input type="search" id="ledger-filter" placeholder="Search session" autocomplete="off" />
+                <kbd>/</kbd>
+              </label>
+            </div>
+          </div>
+
+          <!-- Asymmetric bento: the one ratio that matters gets the wide tile. -->
+          <section class="bento" id="bento" aria-label="Session metrics">
+            <div class="tile tile-hero">
+              <span class="tile-label">Cache hit rate</span>
+              <span class="tile-value" id="st-cache">—</span>
+              <div class="meter"><i id="st-cache-bar"></i></div>
+              <span class="tile-note mono" id="st-cache-note">—</span>
+            </div>
+            <div class="tile">
+              <span class="tile-label">Median TTFT</span>
+              <span class="tile-value" id="st-ttft">—</span>
+              <span class="tile-note mono" id="st-ttft-note">—</span>
+            </div>
+            <div class="tile">
+              <span class="tile-label">Requests</span>
+              <span class="tile-value" id="st-req">—</span>
+              <span class="tile-note mono" id="st-req-note">—</span>
+            </div>
+            <div class="tile">
+              <span class="tile-label">Output</span>
+              <span class="tile-value" id="st-out">—</span>
+              <span class="tile-note mono" id="st-out-note">—</span>
+            </div>
+          </section>
+
+          <section class="timeline" id="timeline" aria-label="Timeline">
+            <div class="lanes" id="lanes"></div>
+            <div class="brush" id="brush" hidden></div>
+            <div class="axis mono"><span id="ax-left">—</span><span id="ax-note" class="note"></span><span id="ax-right">—</span></div>
+          </section>
+
+          <div class="ledger" id="ledger" tabindex="-1">
+            <div class="ledger-inner" id="ledger-inner" role="list"></div>
+          </div>
+
+          <div class="keys mono" aria-hidden="true">
+            <span><kbd>j</kbd><kbd>k</kbd> move</span>
+            <span><kbd>/</kbd> search</span>
+            <span><kbd>esc</kbd> close</span>
+            <span>drag timeline to focus · right-click to clear</span>
+          </div>
+        </div>
+      </main>
+
+      <!-- Inspector -->
+      <section class="shell inspector-shell" id="inspector" hidden aria-label="Inspector">
+        <div class="core inspector">
+          <div class="pane-head">
+            <div class="title-block">
+              <span class="eyebrow id" id="ins-eyebrow">Inspector</span>
+              <span class="ins-title" id="ins-title">—</span>
+            </div>
+            <button class="icon-btn" id="ins-close" aria-label="Close inspector">
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/></svg>
+            </button>
+          </div>
+          <div class="tabs" id="ins-tabs" role="tablist"></div>
+          <div class="content" id="ins-content"></div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

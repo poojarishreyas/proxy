@@ -1,0 +1,41 @@
+{
+  "name": "shrey-cli",
+  "version": "1.2.0",
+  "description": "Run Claude Code through a local capturing proxy: every request and response is recorded, shown in a live trajectory dashboard, pushed to your own GitHub repository, and optionally streamed to a shared multi-user hosted dashboard.",
+  "type": "module",
+  "bin": {
+    "shrey": "src/index.js"
+  },
+  "files": [
+    "src/",
+    "web/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node scripts/test-e2e.mjs && node scripts/test-cli.mjs && node scripts/test-cloud.mjs",
+    "build": "node build.mjs",
+    "prepublishOnly": "node scripts/genassets.mjs && npm test"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "anthropic",
+    "proxy",
+    "trajectory",
+    "observability",
+    "llm",
+    "tracing",
+    "research"
+  ],
+  "author": "Shreyas Ananda Poojary",
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "postject": "^1.0.0-alpha.6"
+  }
+}
