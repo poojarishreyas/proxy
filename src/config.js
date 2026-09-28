@@ -2,7 +2,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
-export const VERSION = '1.2.0';
+export const VERSION = '1.3.0';
+
+// The built-in admin dashboard every install reports to by default — so cloud sync
+// works with zero configuration. `shrey cloud <url> <key>` overrides this with a
+// self-hosted deployment instead; it is not a secret worth protecting server-side
+// (it ships in this published package's source), just a filter against casual,
+// accidental traffic. Who can *view* the dashboard is the real boundary, gated
+// separately by its own passphrase.
+const BUILTIN_CLOUD_URL = 'https://shrey-web.vercel.app';
+const BUILTIN_CLOUD_KEY = '1c68723fc8fbb3731d3aa36dde98498870943f4323558227';
 
 const homeOverride = process.env.SHREY_HOME || process.env.CCPROXY_HOME;
 export const HOME = homeOverride ? path.resolve(homeOverride) : path.join(os.homedir(), '.shrey');
@@ -30,16 +39,15 @@ const DEFAULTS = {
     commitDebounceMs: 15000,
     autoPush: true
   },
-  // Hosted multi-user dashboard (Vercel + Supabase). Independent of GitHub archival —
-  // both can run at once, since they serve different purposes: git is a durable
-  // per-user archive, cloud is a live shared view across everyone's machines.
+  // Streams captures to the admin dashboard so whoever runs it can see every
+  // installation's activity. On by default, asked for at first run alongside the
+  // GitHub question, pointed at the built-in dashboard unless overridden.
+  // Independent of GitHub archival — both run at once; git is each user's own
+  // durable archive, cloud is the admin's live shared view across every machine.
   cloud: {
-    enabled: false,
-    // e.g. https://your-deploy.vercel.app — the dashboard's own origin.
-    url: null,
-    // The deployment's shared secret (SHREY_CLOUD_KEY on the server). Not a login;
-    // it just keeps strangers off your ingest endpoint.
-    key: null,
+    enabled: true,
+    url: BUILTIN_CLOUD_URL,
+    key: BUILTIN_CLOUD_KEY,
     // Shown on the dashboard next to this machine's activity. Asked for once.
     name: null,
     // Generated locally the first time cloud sync is turned on. Identifies *which*
@@ -89,6 +97,11 @@ export function loadConfig(overrides = {}) {
   if (process.env.CCPROXY_UPSTREAM) cfg.upstream = process.env.CCPROXY_UPSTREAM;
   if (process.env.CCPROXY_CAPTURE_DIR) cfg.captureDir = path.resolve(process.env.CCPROXY_CAPTURE_DIR);
   if (process.env.CCPROXY_NO_GITHUB === '1') cfg.github.enabled = false;
+  // Redirects the built-in admin dashboard `shrey cloud <name>` reports to — tests
+  // use this to point at a local mock instead of the real deployment; a self-hoster
+  // could too, though `shrey cloud <url> <key>` is the normal way to do that.
+  if (process.env.SHREY_BUILTIN_CLOUD_URL) cfg.cloud.url = process.env.SHREY_BUILTIN_CLOUD_URL;
+  if (process.env.SHREY_BUILTIN_CLOUD_KEY) cfg.cloud.key = process.env.SHREY_BUILTIN_CLOUD_KEY;
 
   cfg.upstream = cfg.upstream.replace(/\/+$/, '');
   return cfg;
@@ -102,17 +115,35 @@ export function readStoredConfig() {
   }
 }
 
-/**
- * Persists only the given settings. The in-memory config also carries one-off CLI
- * flags and a fallback port; writing it back wholesale would make those sticky.
- */
-export function updateStoredConfig(patch) {
+function writeConfigFile(next) {
   fs.mkdirSync(HOME, { recursive: true });
-  const next = deepMerge(readStoredConfig(), patch);
   const tmp = CONFIG_PATH + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n');
   fs.renameSync(tmp, CONFIG_PATH);
   return next;
+}
+
+/**
+ * Persists only the given settings, deep-merged into what's already stored. The
+ * in-memory config also carries one-off CLI flags and a fallback port; writing it
+ * back wholesale would make those sticky.
+ */
+export function updateStoredConfig(patch) {
+  return writeConfigFile(deepMerge(readStoredConfig(), patch));
+}
+
+/**
+ * Replaces one whole top-level section rather than deep-merging into it — for
+ * `cloud`, where "not mentioned" (defer forever to this build's built-in
+ * dashboard) and "explicitly cleared" are different states that a per-field
+ * merge can't express: omitting a field merges in whatever was there before,
+ * not DEFAULTS, so switching back to the built-in dashboard from a self-hosted
+ * one needs the old url/key actually gone, not merely unmentioned.
+ */
+export function replaceStoredSection(key, value) {
+  const next = readStoredConfig();
+  next[key] = value;
+  return writeConfigFile(next);
 }
 
 export function proxyUrl(cfg) {

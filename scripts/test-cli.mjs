@@ -257,6 +257,121 @@ const ok = (name) => {
   upstream.close();
 }
 
+// --------------------------------------------------- 6. built-in admin dashboard
+{
+  const { PassThrough } = await import('node:stream');
+  const readline = (await import('node:readline/promises')).default;
+  const { setupGithub, setupCloudName, defaultDisplayName } = await import('../src/index.js');
+  const { readStoredConfig } = await import('../src/config.js');
+
+  // Never let this test touch the real production dashboard.
+  const mock = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      mock.lastAuth = req.headers.authorization;
+      mock.lastBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, identityId: 'id-1' }));
+    });
+  });
+  await new Promise((r) => mock.listen(0, '127.0.0.1', r));
+  const mockUrl = 'http://127.0.0.1:' + mock.address().port;
+  process.env.SHREY_BUILTIN_CLOUD_URL = mockUrl;
+  process.env.SHREY_BUILTIN_CLOUD_KEY = 'mock-builtin-key';
+
+  // readline only starts reading once something actually calls question() -
+  // writing to the input stream before that point is not buffered and is lost.
+  // Since the caller (setupGithub/setupCloudName) is what calls question(), the
+  // write is deferred to let that call happen first; the intervening async work
+  // in those functions (at least one await before their question()) comfortably
+  // covers a setImmediate's one-macrotask delay.
+  const scripted = (...answers) => {
+    const input = new PassThrough();
+    const rl = readline.createInterface({ input, terminal: false });
+    let i = 0;
+    const feedNext = () => {
+      if (i >= answers.length) return;
+      setImmediate(() => {
+        input.write(answers[i++] + '\n');
+        feedNext();
+      });
+    };
+    feedNext();
+    return rl;
+  };
+  const devNull = { write: () => true };
+
+  // setup asks for GitHub, then a name - together, in that order, exactly as
+  // `shrey` first run does (this is what was previously wrong: cloud used to be
+  // a separate manual `shrey cloud <url> <key>` step, not part of first-run setup).
+  await setupGithub(scripted('local'), devNull);
+  await setupCloudName(scripted(''), devNull); // blank -> default (OS username)
+
+  let stored = readStoredConfig();
+  assert.equal(stored.github.remote, null, 'setup: github question answered');
+  assert.equal(stored.cloud.enabled, true, 'setup: cloud enabled by default');
+  assert.equal(stored.cloud.name, defaultDisplayName(), 'setup: blank name falls back to the OS username');
+  assert.match(stored.cloud.deviceToken, /^[0-9a-f]{64}$/, 'setup: a device token was generated');
+  assert.ok(!('url' in stored.cloud) && !('key' in stored.cloud), 'setup: built-in form persists no url/key - it keeps following this build\'s default forever');
+  ok('first-run setup asks for GitHub repo and dashboard name together, deferring to the built-in dashboard');
+
+  const firstToken = stored.cloud.deviceToken;
+  await setupCloudName(scripted('Ada'), devNull);
+  stored = readStoredConfig();
+  assert.equal(stored.cloud.name, 'Ada', 'name updated');
+  assert.equal(stored.cloud.deviceToken, firstToken, 're-running setup renames the same identity, not a new one');
+  ok('re-running setup reuses this machine\'s existing identity instead of fragmenting it');
+
+  // `shrey cloud <name>` — the real CLI, non-interactively, using the mock as the
+  // "built-in" dashboard via the test-only env override.
+  const runCloud = (args) =>
+    new Promise((resolve) => {
+      const child = spawn(process.execPath, [path.join(root, 'src', 'index.js'), 'cloud', ...args], {
+        env: { ...process.env },
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+      let out = '';
+      child.stdout.on('data', (d) => { out += d; });
+      child.stderr.on('data', (d) => { out += d; });
+      child.on('exit', (code) => resolve({ code, out }));
+    });
+
+  const r1 = await runCloud(['Grace']);
+  assert.equal(r1.code, 0, '`shrey cloud <name>` exit 0: ' + r1.out);
+  assert.ok(r1.out.includes('Connected'), 'reports connected');
+  assert.equal(mock.lastBody.name, 'Grace', 'the name reached the dashboard');
+  assert.equal(mock.lastAuth, 'Bearer mock-builtin-key', 'authenticated with the built-in key, not one the user had to supply');
+  stored = readStoredConfig();
+  assert.ok(!('url' in stored.cloud) && !('key' in stored.cloud), '`shrey cloud <name>` also persists no url/key');
+  ok('`shrey cloud <name>` needs no URL or key - just a name, using the built-in dashboard');
+
+  // Point at a self-hosted dashboard instead, then switch back to the built-in
+  // one by name - the old self-hosted url/key must actually be gone afterward,
+  // not merely unmentioned (this was the second bug: a naive merge would leave
+  // the stale self-hosted destination in place).
+  const bogus = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}'); });
+  });
+  await new Promise((r) => bogus.listen(0, '127.0.0.1', r));
+  const bogusUrl = 'http://127.0.0.1:' + bogus.address().port;
+  const r2 = await runCloud([bogusUrl, 'bogus-key', '--name', 'Grace']);
+  assert.equal(r2.code, 0, 'self-hosted form saved: ' + r2.out);
+  stored = readStoredConfig();
+  assert.equal(stored.cloud.url, bogusUrl + '/', 'self-hosted url persisted this time');
+
+  const r3 = await runCloud(['Grace']);
+  assert.equal(r3.code, 0, 'switch back to built-in: ' + r3.out);
+  stored = readStoredConfig();
+  assert.ok(!('url' in stored.cloud) && !('key' in stored.cloud), 'switching back to the built-in form actually clears the old self-hosted url/key');
+  ok('switching from a self-hosted dashboard back to the built-in one clears the old override, not just leaves it unmentioned');
+
+  mock.close();
+  bogus.close();
+}
+
 fs.rmSync(TMP, { recursive: true, force: true });
 console.log('\n  ' + passed + ' CLI checks passed.\n');
 process.exit(0);

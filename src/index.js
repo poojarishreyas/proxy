@@ -2,9 +2,10 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import url from 'node:url';
 import readline from 'node:readline/promises';
 import { spawn, execFile, execFileSync } from 'node:child_process';
-import { loadConfig, updateStoredConfig, readStoredConfig, proxyUrl, VERSION, HOME, CONFIG_PATH } from './config.js';
+import { loadConfig, updateStoredConfig, replaceStoredSection, readStoredConfig, proxyUrl, VERSION, HOME, CONFIG_PATH } from './config.js';
 import { startServer } from './server.js';
 import { DASH_PREFIX } from './dashboard.js';
 import { normalizeGithubUrl, ghAuthenticated } from './github.js';
@@ -59,7 +60,7 @@ const HELP = [
   '  shrey [claude args]        same, passing arguments to Claude Code (shrey --resume)',
   '  shrey setup                choose where captures are pushed',
   '  shrey github [url|off]     show or set the GitHub repository captures push to',
-  '  shrey cloud [url] [key]    show or set the hosted dashboard captures stream to',
+  '  shrey cloud [name|off]     show status, set your name, or stop reporting to the admin dashboard',
   '  shrey dashboard            open the trajectory dashboard of a running shrey',
   '  shrey serve                run only the proxy and dashboard',
   '  shrey status               settings, session count, token totals',
@@ -75,8 +76,6 @@ const HELP = [
   '  --raw              also keep verbatim request/response JSON',
   '  --                 everything after goes to Claude Code as-is',
   '',
-  '  --name <you>       display name for cloud sync (asked interactively otherwise)',
-  '',
   'Captures: ' + path.join(HOME, 'captures'),
   'Settings: ' + CONFIG_PATH,
   ''
@@ -89,12 +88,24 @@ async function setupWizard({ force = false } = {}) {
   if (stored.setupDone && !force) return;
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     // Nothing is pushed without an answer; say how to give one.
-    console.error('[shrey] captures stay local until you run: shrey setup   (or shrey github <url>)');
+    console.error('[shrey] captures stay local, and cloud sync is off, until you run: shrey setup');
+    updateStoredConfig({ setupDone: true, cloud: { enabled: false } });
     return;
   }
 
-  const gh = await ghAuthenticated();
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const out = process.stdout;
+  try {
+    await setupGithub(rl, out);
+    await setupCloudName(rl, out);
+    updateStoredConfig({ setupDone: true });
+  } finally {
+    rl.close();
+  }
+}
+
+async function setupGithub(rl, out) {
+  const gh = await ghAuthenticated();
   out.write('\n  shrey · setup\n\n');
   out.write('  shrey records every request Claude Code makes and can push the recordings\n');
   out.write('  to a GitHub repository you own. Recordings include your prompts, code and\n');
@@ -106,38 +117,68 @@ async function setupWizard({ force = false } = {}) {
   if (!gh) out.write('\n    (sign in with "gh auth login" to let shrey create the repo for you)\n');
   out.write('\n');
 
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const answer = (await rl.question('  > ')).trim();
-      if (!answer) {
-        if (gh) {
-          updateStoredConfig({ setupDone: true, github: { autoCreate: true, remote: null } });
-          out.write('\n  A private repo will be created on first run. Change it any time: shrey github <url>\n\n');
-        } else {
-          updateStoredConfig({ setupDone: true, github: { autoCreate: false, remote: null } });
-          out.write('\n  Keeping captures local. Push later with: shrey github <url>\n\n');
-        }
-        return;
-      }
-      if (/^(local|no|n|off)$/i.test(answer)) {
-        updateStoredConfig({ setupDone: true, github: { autoCreate: false, remote: null } });
-        out.write('\n  Keeping captures local. Push later with: shrey github <url>\n\n');
-        return;
-      }
-      const target = normalizeGithubUrl(answer);
-      if (target) {
-        updateStoredConfig({ setupDone: true, github: { remote: target.web, autoCreate: false } });
-        out.write('\n  Captures will push to ' + target.web + '\n');
-        out.write('  (created as private if it does not exist and gh is signed in)\n\n');
-        return;
-      }
-      out.write('  That is not a GitHub repository URL. Try https://github.com/you/repo\n');
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const answer = (await rl.question('  > ')).trim();
+    if (!answer) {
+      updateStoredConfig({ github: { autoCreate: gh, remote: null } });
+      out.write(gh
+        ? '\n  A private repo will be created on first run. Change it any time: shrey github <url>\n\n'
+        : '\n  Keeping captures local. Push later with: shrey github <url>\n\n');
+      return;
     }
-    updateStoredConfig({ setupDone: true, github: { autoCreate: false, remote: null } });
-    out.write('\n  Keeping captures local for now. Set a repo later: shrey github <url>\n\n');
-  } finally {
-    rl.close();
+    if (/^(local|no|n|off)$/i.test(answer)) {
+      updateStoredConfig({ github: { autoCreate: false, remote: null } });
+      out.write('\n  Keeping captures local. Push later with: shrey github <url>\n\n');
+      return;
+    }
+    const target = normalizeGithubUrl(answer);
+    if (target) {
+      updateStoredConfig({ github: { remote: target.web, autoCreate: false } });
+      out.write('\n  Captures will push to ' + target.web + '\n');
+      out.write('  (created as private if it does not exist and gh is signed in)\n\n');
+      return;
+    }
+    out.write('  That is not a GitHub repository URL. Try https://github.com/you/repo\n');
+  }
+  updateStoredConfig({ github: { autoCreate: false, remote: null } });
+  out.write('\n  Keeping captures local for now. Set a repo later: shrey github <url>\n\n');
+}
+
+/**
+ * The admin dashboard: on by default, pointed at the built-in deployment. This
+ * only needs a name — there is no login, no email, nothing else to configure.
+ * `shrey cloud off` (or `shrey cloud <own-url> <own-key>`) is the escape hatch
+ * for anyone who wants out, or their own deployment instead of the built-in one.
+ */
+async function setupCloudName(rl, out) {
+  out.write('  shrey also reports live to an admin dashboard, so activity across every\n');
+  out.write('  machine running shrey can be watched in one place, under a name you choose.\n\n');
+  out.write('  What name should show on the dashboard?\n');
+  out.write('    press Enter    use "' + defaultDisplayName() + '"\n');
+  out.write('    type off       do not report anywhere; stays entirely local (+ GitHub, if set above)\n\n');
+
+  const answer = (await rl.question('  > ')).trim();
+  if (/^(off|no|n|none)$/i.test(answer)) {
+    replaceStoredSection('cloud', { enabled: false });
+    out.write('\n  Not reporting anywhere. Turn it on any time: shrey cloud <name>\n\n');
+    return;
+  }
+  const name = answer || defaultDisplayName();
+  // Reuse this machine's existing device identity if it has one, so re-running
+  // setup renames it rather than minting a new identity that fragments its
+  // history on the dashboard. No url/key here: the built-in dashboard is
+  // whatever this installed version's DEFAULTS say, followed automatically
+  // forever (including across upgrades).
+  const deviceToken = readStoredConfig().cloud?.deviceToken || generateDeviceToken();
+  replaceStoredSection('cloud', { enabled: true, name, deviceToken });
+  out.write('\n  Reporting as "' + name + '". Change your name or turn this off: shrey cloud <name|off>\n\n');
+}
+
+function defaultDisplayName() {
+  try {
+    return os.userInfo().username || 'anonymous';
+  } catch {
+    return 'anonymous';
   }
 }
 
@@ -220,7 +261,7 @@ async function cmdLaunch(cfg, flags, claudeArgs) {
     : cfg.github.remote
       ? cfg.github.remote.replace(/^https:\/\//, '')
       : cfg.github.autoCreate ? 'github (creating private repo)' : 'local only';
-  const cloudNote = cfg.cloud?.enabled ? ' · cloud: ' + cfg.cloud.name : '';
+  const cloudNote = cfg.cloud?.enabled && cfg.cloud?.name ? ' · cloud: ' + cfg.cloud.name : '';
   print('\x1b[2mshrey · capturing → ' + destination + cloudNote + ' · dashboard ' + dash + '\x1b[0m');
   if (flags.open) openBrowser(dash);
 
@@ -305,7 +346,7 @@ async function cmdServe(cfg, flags) {
   console.log('  dashboard  ' + dash);
   console.log('  captures   ' + cfg.captureDir);
   console.log('  pushing to ' + (a?.web ?? a?.remote ?? 'nowhere (local only) — set one with: shrey github <url>'));
-  if (cfg.cloud?.enabled) console.log('  cloud sync ' + cfg.cloud.url + '  as "' + cfg.cloud.name + '"');
+  if (cfg.cloud?.enabled && cfg.cloud?.name) console.log('  reporting  ' + cfg.cloud.url + '  as "' + cfg.cloud.name + '"');
   console.log('');
   console.log('  Point any Claude Code at it:  ANTHROPIC_BASE_URL=' + started.url);
   console.log('  Ctrl+C to stop.');
@@ -366,71 +407,86 @@ async function cmdGithub(cfg, rest) {
 }
 
 /**
- * Turns on (or off, or reports) streaming to a hosted shrey dashboard. Distinct
- * from `shrey github`: git archival is a durable per-user backup, this is a live
- * shared view across everyone pointed at the same deployment. The two don't
- * interact and either can be on without the other.
+ * Turns on (or off, or reports) streaming to the admin dashboard. Distinct from
+ * `shrey github`: git archival is a durable per-user backup, this is the admin's
+ * live shared view across every machine running shrey. The two don't interact and
+ * either can be on without the other.
+ *
+ *   shrey cloud                    show current status
+ *   shrey cloud <name>             report to the built-in dashboard as <name>
+ *   shrey cloud off                stop reporting
+ *   shrey cloud <url> <key>        report to a self-hosted dashboard instead
  */
 async function cmdCloud(cfg, rest, flags) {
-  const [urlArg, keyArg] = rest;
+  const [first, second] = rest;
   const stored = readStoredConfig();
 
-  if (urlArg === undefined) {
-    if (!stored.cloud?.enabled) {
-      console.log('Cloud sync is off. Turn it on with: shrey cloud <dashboard-url> <cloud-key>');
+  if (first === undefined) {
+    if (!stored.cloud || stored.cloud.enabled === false) {
+      console.log('Cloud sync is off. Turn it on with: shrey cloud <your name>');
     } else {
-      console.log('Syncing to ' + stored.cloud.url + ' as "' + stored.cloud.name + '"');
+      console.log('Reporting to ' + (stored.cloud.url || cfg.cloud.url) + ' as "' + stored.cloud.name + '"');
     }
     return;
   }
-  if (['off', 'none', 'local'].includes(urlArg)) {
-    updateStoredConfig({ cloud: { enabled: false } });
+  if (['off', 'none', 'local'].includes(first)) {
+    replaceStoredSection('cloud', { enabled: false });
     console.log('Cloud sync turned off. Local capture (and GitHub, if set) are unaffected.');
     return;
   }
 
-  let url;
-  try {
-    url = new URL(urlArg).toString();
-  } catch {
-    console.error('Not a URL: ' + urlArg);
-    console.error('Usage: shrey cloud https://your-deploy.vercel.app <cloud-key>');
-    process.exitCode = 1;
-    return;
-  }
-  if (!keyArg) {
-    console.error('Also pass the cloud key from the dashboard’s deployment (its SHREY_CLOUD_KEY).');
-    process.exitCode = 1;
-    return;
-  }
+  // `shrey cloud <url> <key>` — a self-hosted dashboard instead of the built-in one.
+  const looksLikeUrl = /^https?:\/\//i.test(first);
+  let url = cfg.cloud.url;
+  let key = cfg.cloud.key;
+  let name = flags.name || (looksLikeUrl ? stored.cloud?.name : first);
 
-  let name = flags.name || stored.cloud?.name;
-  if (!name) {
-    if (!process.stdin.isTTY) {
-      console.error('First time on this machine: also pass --name "Your Name" (shown on the dashboard).');
+  if (looksLikeUrl) {
+    if (!second) {
+      console.error('Also pass that deployment’s cloud key (its SHREY_CLOUD_KEY): shrey cloud <url> <key>');
       process.exitCode = 1;
       return;
     }
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    console.log('');
-    name = (await rl.question('  What name should show on the dashboard?  > ')).trim();
-    rl.close();
+    try {
+      url = new URL(first).toString();
+    } catch {
+      console.error('Not a URL: ' + first);
+      process.exitCode = 1;
+      return;
+    }
+    key = second;
     if (!name) {
-      console.error('A name is required.');
-      process.exitCode = 1;
-      return;
+      if (!process.stdin.isTTY) {
+        console.error('First time on this machine: also pass --name "Your Name".');
+        process.exitCode = 1;
+        return;
+      }
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      name = (await rl.question('\n  What name should show on the dashboard?  > ')).trim();
+      rl.close();
+      if (!name) {
+        console.error('A name is required.');
+        process.exitCode = 1;
+        return;
+      }
     }
   }
-  const deviceToken = stored.cloud?.deviceToken || generateDeviceToken();
 
-  updateStoredConfig({ cloud: { enabled: true, url, key: keyArg, name, deviceToken } });
+  const deviceToken = stored.cloud?.deviceToken || generateDeviceToken();
+  // Only an explicit `<url> <key>` is persisted. The built-in form deliberately
+  // leaves url/key out of config.json (replaceStoredSection, not a merge — so a
+  // previously self-hosted url/key is actually dropped, not left stale), meaning
+  // it keeps following whatever this installed shrey-cli's built-in dashboard is,
+  // including across upgrades, with no need to ever re-run this.
+  updateStoredConfig({ setupDone: true });
+  replaceStoredSection('cloud', looksLikeUrl ? { enabled: true, url, key, name, deviceToken } : { enabled: true, name, deviceToken });
 
   // Verify it actually works right away, rather than making the user wait for
-  // their next real Claude Code session to find out the key was wrong.
+  // their next real Claude Code session to find out something was wrong.
   try {
     const res = await fetch(url.replace(/\/+$/, '') + '/api/ingest', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: 'Bearer ' + keyArg },
+      headers: { 'content-type': 'application/json', authorization: 'Bearer ' + key },
       body: JSON.stringify({
         deviceToken,
         name,
@@ -442,7 +498,6 @@ async function cmdCloud(cfg, rest, flags) {
     const data = await res.json().catch(() => ({}));
     if (!res.ok || data.ok === false) {
       console.error('Saved, but could not verify the connection: ' + (data.error || 'HTTP ' + res.status));
-      console.error('Double-check the URL and key, then run this again.');
       process.exitCode = 1;
       return;
     }
@@ -472,7 +527,7 @@ async function cmdStatus(cfg) {
   console.log('  settings   ' + CONFIG_PATH);
   console.log('  captures   ' + cfg.captureDir);
   console.log('  github     ' + (stored.github?.remote ?? (stored.github?.autoCreate ? 'auto-create on next run' : 'local only')));
-  console.log('  cloud      ' + (stored.cloud?.enabled ? stored.cloud.url + ' as "' + stored.cloud.name + '"' : 'off'));
+  console.log('  cloud      ' + (stored.cloud?.enabled && stored.cloud?.name ? (stored.cloud.url || cfg.cloud.url) + ' as "' + stored.cloud.name + '"' : 'off'));
   console.log('  sessions   ' + sessions.length + ', ' + totals.req + ' requests, ' +
     totals.in.toLocaleString('en-US') + ' in / ' + totals.out.toLocaleString('en-US') + ' out tokens');
   console.log('  running    ' + (runs.length ? runs.map((r) => r.url + '  (' + r.cwd + ')').join('\n             ') : 'none'));
@@ -593,7 +648,15 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  process.stderr.write('shrey: ' + (err?.stack ?? err) + '\n');
-  process.exit(1);
-});
+// Exported so scripts/test-cli.mjs can exercise the interactive prompts directly
+// (readline works fine over a plain pipe; only the top-level TTY gate in
+// setupWizard() needs a real terminal, and tests bypass that gate on purpose).
+export { setupGithub, setupCloudName, defaultDisplayName, cmdCloud };
+
+const isEntryPoint = process.argv[1] && import.meta.url === url.pathToFileURL(process.argv[1]).href;
+if (isEntryPoint) {
+  main().catch((err) => {
+    process.stderr.write('shrey: ' + (err?.stack ?? err) + '\n');
+    process.exit(1);
+  });
+}
