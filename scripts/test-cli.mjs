@@ -22,7 +22,7 @@ const HOME = path.join(TMP, 'home');
 process.env.SHREY_HOME = HOME; // before config.js is imported: HOME is read once
 process.env.SHREY_NO_GH = '1'; // never let a test reach real GitHub
 
-const { parseArgs } = await import('../src/args.js');
+const { parseArgs, takeNameFlag } = await import('../src/args.js');
 const { normalizeGithubUrl } = await import('../src/github.js');
 const { loadConfig } = await import('../src/config.js');
 const { startServer } = await import('../src/server.js');
@@ -58,6 +58,29 @@ const ok = (name) => {
   assert.equal(r.command, null, 'claude subcommands are not swallowed');
   assert.deepEqual(r.rest, ['config', 'list']);
   ok('arguments route to shrey or to Claude Code');
+
+  // Everything Claude Code owns stays Claude Code's.
+  r = parseArgs(['--name', 'my session', '-p', 'hi']);
+  assert.deepEqual(r.rest, ['--name', 'my session', '-p', 'hi'], '--name is Claude\'s session name, not shrey\'s');
+  r = parseArgs(['-r']);
+  assert.deepEqual([r.command, r.rest, r.passthrough, r.detaching], [null, ['-r'], null, false], '-r resumes a normal captured session');
+  r = parseArgs(['--resume', 'abc123', '--fork-session']);
+  assert.deepEqual(r.rest, ['--resume', 'abc123', '--fork-session']);
+  r = parseArgs(['install', 'stable']);
+  assert.deepEqual(r.passthrough, ['install', 'stable'], '`install` is Claude\'s subcommand now, not shrey\'s');
+  r = parseArgs(['mcp', 'add', 'x', '--help']);
+  assert.deepEqual(r.passthrough, ['mcp', 'add', 'x', '--help'], '--help after a Claude subcommand is Claude\'s');
+  r = parseArgs(['--no-push', 'update']);
+  assert.deepEqual(r.passthrough, ['update'], 'shrey flags before a Claude subcommand are dropped, the rest passes');
+  r = parseArgs(['--', 'mcp', 'list']);
+  assert.deepEqual(r.passthrough, ['mcp', 'list']);
+  r = parseArgs(['--bg', 'fix the tests']);
+  assert.equal(r.detaching, true, '--bg needs a proxy that outlives the command');
+  r = parseArgs(['-p', 'about --bg flags']);
+  assert.equal(r.detaching, false, 'only the exact flag detaches, not text mentioning it');
+  const t = takeNameFlag(['Grace', '--name', 'Ada', 'x']);
+  assert.deepEqual([t.name, t.args], ['Ada', ['Grace', 'x']]);
+  ok('Claude Code\'s own flags and subcommands are never claimed by shrey');
 }
 
 // ----------------------------------------------------- 2. GitHub URL shapes
@@ -184,18 +207,55 @@ const ok = (name) => {
   });
   await new Promise((r) => upstream.listen(9953, '127.0.0.1', r));
 
-  // Fake Claude Code: calls the API through whatever base URL it was given and
-  // reports its argv, cwd and base URL, then exits with a distinctive code.
+  // Fake Claude Code. Default: a model session - calls the API through whatever
+  // base URL it was given (if any), reports argv/cwd/base URL, prints one line to
+  // stdout, exits 7. Also: --version/--help, `agents --json` (lists live fake
+  // background workers), and --bg (spawns a detached worker that calls the API
+  // only after this foreground process has already exited, then idles until told
+  // to stop - the shape of a real `claude --bg` session).
   const fakeDir = path.join(TMP, 'fake-claude');
   fs.mkdirSync(fakeDir, { recursive: true });
   const report = path.join(TMP, 'fake-report.json');
+  const stateDir = path.join(TMP, 'fake-bg-state');
   fs.writeFileSync(path.join(fakeDir, 'fake.mjs'), [
     "import fs from 'node:fs';",
+    "import path from 'node:path';",
+    "import { spawn } from 'node:child_process';",
     'const args = process.argv.slice(2);',
     'const base = process.env.ANTHROPIC_BASE_URL;',
-    "const r = await fetch(base + '/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 'sk-ant-fake-key-000000' }, body: JSON.stringify({ model: 'fake', max_tokens: 5, stream: true, messages: [{ role: 'user', content: args.join(' ') }] }) });",
-    'await r.text();',
-    'fs.writeFileSync(process.env.FAKE_REPORT, JSON.stringify({ args, cwd: process.cwd(), base, status: r.status }));',
+    'const stateDir = process.env.FAKE_STATE;',
+    'const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };',
+    'const call = async (content) => {',
+    "  const r = await fetch(base + '/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 'sk-ant-fake-key-000000' }, body: JSON.stringify({ model: 'fake', max_tokens: 5, stream: true, messages: [{ role: 'user', content }] }) });",
+    '  await r.text();',
+    '  return r.status;',
+    '};',
+    "if (args[0] === '--version') { process.stdout.write('9.9.9 (Fake Claude)\\n'); process.exit(0); }",
+    "if (args[0] === '--help') { process.stdout.write('FAKE CLAUDE HELP\\n'); process.exit(0); }",
+    "if (args[0] === 'agents' && args.includes('--json')) {",
+    "  const list = fs.existsSync(stateDir) ? fs.readdirSync(stateDir).filter((f) => f.endsWith('.json')).map((f) => JSON.parse(fs.readFileSync(path.join(stateDir, f), 'utf8'))).filter((s) => alive(s.pid)) : [];",
+    '  process.stdout.write(JSON.stringify(list));',
+    '  process.exit(0);',
+    '}',
+    "if (args[0] === '__bg-worker') {",
+    '  fs.mkdirSync(stateDir, { recursive: true });',
+    "  const me = path.join(stateDir, process.pid + '.json');",
+    "  fs.writeFileSync(me, JSON.stringify({ pid: process.pid, kind: 'background', startedAt: Date.now() }));",
+    '  await new Promise((r) => setTimeout(r, 1500));',
+    "  await call(args.slice(1).join(' '));",
+    "  while (!fs.existsSync(path.join(stateDir, 'STOP'))) await new Promise((r) => setTimeout(r, 100));",
+    '  fs.rmSync(me, { force: true });',
+    '  process.exit(0);',
+    '}',
+    "if (args.includes('--bg')) {",
+    "  const rest = args.filter((a) => a !== '--bg');",
+    "  spawn(process.execPath, [process.argv[1], '__bg-worker', ...rest], { detached: true, stdio: 'ignore', env: process.env, windowsHide: true }).unref();",
+    "  process.stdout.write('backgrounded\\n');",
+    '  process.exit(0);',
+    '}',
+    'const status = base ? await call(args.join(\' \')) : null;',
+    'fs.writeFileSync(process.env.FAKE_REPORT, JSON.stringify({ args, cwd: process.cwd(), base: base ?? null, status }));',
+    "process.stdout.write('FAKE-STDOUT\\n');",
     'process.exit(7);',
     ''
   ].join('\n'));
@@ -218,17 +278,22 @@ const ok = (name) => {
   const env = { ...process.env, SHREY_HOME: HOME, SHREY_NO_GH: '1', CCPROXY_UPSTREAM: 'http://127.0.0.1:9953', CLAUDE_CODE_EXECPATH: fakeBin, FAKE_REPORT: report };
   delete env.ANTHROPIC_BASE_URL;
 
-  const result = await new Promise((resolve) => {
-    const child = spawn(process.execPath, [path.join(root, 'src', 'index.js'), '-p', 'hello "quoted" world', '--model', 'opus', '--port', '9954', '--no-push'], {
-      cwd: work,
-      env,
-      stdio: ['ignore', 'pipe', 'pipe']
+  const shrey = (args, extraEnv = {}) =>
+    new Promise((resolve) => {
+      const child = spawn(process.execPath, [path.join(root, 'src', 'index.js'), ...args], {
+        cwd: work,
+        env: { ...env, ...extraEnv },
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (d) => { stdout += d; });
+      child.stderr.on('data', (d) => { stderr += d; });
+      child.on('exit', (code) => resolve({ code, stdout, stderr, out: stdout + stderr }));
     });
-    let out = '';
-    child.stdout.on('data', (d) => { out += d; });
-    child.stderr.on('data', (d) => { out += d; });
-    child.on('exit', (code) => resolve({ code, out }));
-  });
+  const readReport = () => JSON.parse(fs.readFileSync(report, 'utf8'));
+
+  const result = await shrey(['-p', 'hello "quoted" world', '--model', 'opus', '--port', '9954', '--no-push']);
 
   assert.ok(fs.existsSync(report), 'fake claude ran. output:\n' + result.out);
   const rep = JSON.parse(fs.readFileSync(report, 'utf8'));
@@ -238,8 +303,9 @@ const ok = (name) => {
   assert.notEqual(new URL(rep.base).port, '9954', 'busy port → a free one was used');
   assert.equal(rep.status, 200, 'the call went through the proxy to the upstream');
   assert.equal(result.code, 7, 'exit code of Claude Code is propagated');
-  assert.ok(result.out.includes('shrey · capturing'), 'banner printed');
-  assert.ok(result.out.includes('session(s) captured'), 'summary printed');
+  assert.ok(result.stderr.includes('shrey · capturing'), 'banner printed, on stderr');
+  assert.ok(result.stderr.includes('session(s) captured'), 'summary printed, on stderr');
+  assert.equal(result.stdout.trim(), 'FAKE-STDOUT', 'stdout is exactly Claude Code\'s - nothing of shrey\'s mixed into it');
 
   const sessionsDir = path.join(HOME, 'captures', 'sessions');
   const days = fs.readdirSync(sessionsDir);
@@ -252,6 +318,80 @@ const ok = (name) => {
   assert.ok(!fs.readFileSync(path.join(captured, 'session.jsonl'), 'utf8').includes('sk-ant-fake-key-000000'), 'key redacted');
   assert.equal(fs.readdirSync(path.join(HOME, 'run')).length, 0, 'run registry cleaned up on exit');
   ok('`shrey` launches Claude Code in the cwd with args intact, captures, and exits with its code');
+
+  // --name belongs to Claude (it names the session) - it must reach Claude.
+  fs.rmSync(report, { force: true });
+  const named = await shrey(['-p', 'hi', '--name', 'my session', '--no-push']);
+  assert.equal(named.code, 7);
+  assert.deepEqual(readReport().args, ['-p', 'hi', '--name', 'my session'], '--name reaches Claude Code');
+  assert.ok(readReport().base, 'and it is still a captured session');
+  ok('`shrey --name ...` names the Claude session, like `claude --name ...`');
+
+  // Management subcommands: straight to Claude, no proxy, no banner, same exit code.
+  for (const cmd of [['mcp', 'list', '--help'], ['install', 'stable'], ['update']]) {
+    fs.rmSync(report, { force: true });
+    const r = await shrey(cmd);
+    assert.equal(r.code, 7, cmd.join(' ') + ': exit code passes through');
+    assert.deepEqual(readReport().args, cmd, cmd.join(' ') + ': arguments reach Claude untouched');
+    assert.equal(readReport().base, null, cmd.join(' ') + ': no proxy in between');
+    assert.equal(r.stdout.trim(), 'FAKE-STDOUT', cmd.join(' ') + ': output is only Claude\'s');
+    assert.ok(!r.stderr.includes('shrey'), cmd.join(' ') + ': no shrey banner');
+  }
+  ok('`shrey mcp ...`, `shrey install`, `shrey update` behave exactly like `claude ...`');
+
+  const { VERSION } = await import('../src/config.js');
+  const ver = await shrey(['--version']);
+  assert.ok(ver.stdout.includes(VERSION + ' (shrey)') && ver.stdout.includes('9.9.9 (Fake Claude)'), 'both versions: ' + ver.stdout);
+  const help = await shrey(['--help']);
+  assert.ok(help.stdout.includes('shrey cloud') && help.stdout.includes('FAKE CLAUDE HELP'), 'both helps');
+  ok('`shrey --version` / `--help` show shrey\'s and then Claude Code\'s');
+
+  // --bg: the foreground command returns at once; the session it started keeps
+  // calling the API afterwards and must still be captured, and the background
+  // proxy must go away by itself once that session is stopped.
+  const bgEnv = { FAKE_STATE: stateDir, SHREY_DAEMON_POLL_MS: '300', SHREY_DAEMON_GRACE_MS: '500' };
+  const t0 = Date.now();
+  const bg = await shrey(['--bg', 'background hello'], bgEnv);
+  let daemonPid = null;
+  try {
+    assert.equal(bg.code, 0, '--bg exit code: ' + bg.out);
+    assert.ok(Date.now() - t0 < 15000, '--bg returns without waiting for the session');
+    assert.equal(bg.stdout.trim(), 'backgrounded', 'stdout is only Claude\'s');
+
+    const findSession = () => {
+      const sessionsRoot = path.join(HOME, 'captures', 'sessions');
+      for (const d of fs.readdirSync(sessionsRoot)) {
+        for (const id of fs.readdirSync(path.join(sessionsRoot, d))) {
+          const m = path.join(sessionsRoot, d, id, 'manifest.json');
+          if (fs.existsSync(m) && JSON.parse(fs.readFileSync(m, 'utf8')).title === 'background hello') return true;
+        }
+      }
+      return false;
+    };
+    const deadline = Date.now() + 20000;
+    while (!findSession() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
+    assert.ok(findSession(), 'a request made after `shrey --bg` returned was still captured');
+
+    const runs = fs.readdirSync(path.join(HOME, 'run')).filter((f) => f.endsWith('.json') && !f.startsWith('handoff'))
+      .map((f) => JSON.parse(fs.readFileSync(path.join(HOME, 'run', f), 'utf8')));
+    const daemon = runs.find((r) => r.kind === 'background');
+    assert.ok(daemon, 'the background proxy is registered (so `shrey dashboard` can find it)');
+    daemonPid = daemon.pid;
+    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    assert.ok(alive(daemonPid), 'background proxy still running while the session is');
+    ok('`shrey --bg` captures a session that keeps running after the command returns');
+
+    fs.writeFileSync(path.join(stateDir, 'STOP'), '');
+    const gone = Date.now() + 15000;
+    while (alive(daemonPid) && Date.now() < gone) await new Promise((r) => setTimeout(r, 200));
+    assert.ok(!alive(daemonPid), 'background proxy exits once no session is left');
+    assert.ok(!fs.existsSync(path.join(HOME, 'run', daemonPid + '.json')), 'and deregisters itself');
+    daemonPid = null;
+    ok('the background proxy shuts itself down when the session is stopped');
+  } finally {
+    fs.writeFileSync(path.join(stateDir, 'STOP'), '');
+    if (daemonPid) { try { process.kill(daemonPid); } catch { /* already gone */ } }
+  }
 
   squatter.close();
   upstream.close();

@@ -1,6 +1,6 @@
 {
   "name": "shrey-cli",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Run Claude Code through a local capturing proxy: every request and response is recorded, shown in a live trajectory dashboard, pushed to your own GitHub repository, and reported by default to a built-in admin dashboard so every install's activity can be monitored in one place.",
   "type": "module",
   "bin": {

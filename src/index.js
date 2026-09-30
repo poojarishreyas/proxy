@@ -5,12 +5,13 @@ import path from 'node:path';
 import url from 'node:url';
 import readline from 'node:readline/promises';
 import { spawn, execFile, execFileSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { loadConfig, updateStoredConfig, replaceStoredSection, readStoredConfig, proxyUrl, VERSION, HOME, CONFIG_PATH } from './config.js';
 import { startServer } from './server.js';
 import { DASH_PREFIX } from './dashboard.js';
 import { normalizeGithubUrl, ghAuthenticated } from './github.js';
 import { generateDeviceToken } from './cloud.js';
-import { parseArgs } from './args.js';
+import { parseArgs, takeNameFlag } from './args.js';
 
 const CLAUDE_SETTINGS = path.join(os.homedir(), '.claude', 'settings.json');
 const RUN_DIR = path.join(HOME, 'run');
@@ -55,6 +56,10 @@ function inheritedUpstream() {
 const HELP = [
   'shrey ' + VERSION + ' — capture everything Claude Code sends and receives',
   '',
+  'shrey is claude with capture: anything you would type after `claude` works after',
+  '`shrey` and behaves the same - shrey --resume, shrey -c, shrey -p "...", shrey --bg,',
+  'shrey --model ..., shrey mcp list, shrey update, and so on.',
+  '',
   'USAGE',
   '  shrey                      open Claude Code in this folder, capturing every request',
   '  shrey [claude args]        same, passing arguments to Claude Code (shrey --resume)',
@@ -87,9 +92,10 @@ async function setupWizard({ force = false } = {}) {
   const stored = readStoredConfig();
   if (stored.setupDone && !force) return;
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    // Nothing is pushed without an answer; say how to give one.
-    console.error('[shrey] captures stay local, and cloud sync is off, until you run: shrey setup');
-    updateStoredConfig({ setupDone: true, cloud: { enabled: false } });
+    // Can't ask (piped or scripted). Nothing is pushed or reported without an
+    // answer, and nothing is recorded as answered: the next run in a real
+    // terminal still asks.
+    process.stderr.write('[shrey] not set up yet - capturing locally only. Run `shrey setup` in a terminal to choose.\n');
     return;
   }
 
@@ -235,57 +241,77 @@ function logToFile() {
   return write;
 }
 
+/**
+ * shrey's own one-line status messages. Always stderr, never stdout: stdout is
+ * Claude Code's, so `shrey -p --output-format json "..." | jq` gets exactly the
+ * bytes `claude` would have produced. Bound to the real stream up front, so
+ * logToFile() redirecting console.* later can't swallow it.
+ */
+function makeNotice() {
+  const write = process.stderr.write.bind(process.stderr);
+  const tty = Boolean(process.stderr.isTTY);
+  return (text) => write((tty ? '\x1b[2m' + text + '\x1b[0m' : text) + '\n');
+}
+
+function destinationLabel(cfg) {
+  const git = cfg.github.enabled === false
+    ? 'local (no git)'
+    : cfg.github.remote
+      ? cfg.github.remote.replace(/^https:\/\//, '')
+      : cfg.github.autoCreate ? 'github (creating private repo)' : 'local only';
+  const cloud = cfg.cloud?.enabled && cfg.cloud?.name ? ' · cloud: ' + cfg.cloud.name : '';
+  return git + cloud;
+}
+
+function claudeMissing() {
+  process.stderr.write('shrey: Claude Code is not installed or not on PATH.\n');
+  process.stderr.write('Install it: npm install -g @anthropic-ai/claude-code\n');
+  process.exitCode = 1;
+}
+
+/**
+ * Runs Claude Code in the foreground with this terminal, returning its exit code.
+ * Ctrl+C belongs to Claude Code (it interrupts a response), so shrey ignores it and
+ * lets the child decide; a closed terminal or a kill is forwarded instead.
+ */
+function runClaude(bin, args, env) {
+  process.on('SIGINT', () => {});
+  let child;
+  for (const sig of ['SIGTERM', 'SIGHUP']) {
+    process.on(sig, () => child?.kill(sig));
+  }
+  return new Promise((resolve) => {
+    child = spawnClaude(bin, args, { cwd: process.cwd(), env, stdio: 'inherit' });
+    child.on('error', (err) => {
+      process.stderr.write('shrey: failed to launch Claude Code: ' + err.message + '\n');
+      resolve(1);
+    });
+    // A signal-terminated child has no exit code; report failure, not success.
+    child.on('exit', (code, signal) => resolve(code ?? (signal ? 1 : 0)));
+  });
+}
+
 async function cmdLaunch(cfg, flags, claudeArgs) {
   await setupWizard();
-  const fresh = loadConfig(overridesFrom(flags));
-  Object.assign(cfg, fresh);
+  Object.assign(cfg, loadConfig(overridesFrom(flags)));
   if (!flags.upstream && inheritedUpstream()) cfg.upstream = inheritedUpstream().replace(/\/+$/, '');
 
   const bin = resolveClaude();
-  if (!bin) {
-    console.error('shrey: Claude Code is not installed or not on PATH.');
-    console.error('Install it: npm install -g @anthropic-ai/claude-code');
-    process.exitCode = 1;
-    return;
-  }
+  if (!bin) return claudeMissing();
 
-  const print = console.log.bind(console);
+  const notice = makeNotice();
   const launchedAt = Date.now();
   const log = logToFile();
   const started = await startServer(cfg, { log, portFallback: true, awaitArchive: false });
   const dash = started.url + DASH_PREFIX + '/';
   registerRun({ pid: process.pid, port: cfg.port, url: dash, cwd: process.cwd(), startedAt: Date.now() });
 
-  const destination = cfg.github.enabled === false
-    ? 'local (no git)'
-    : cfg.github.remote
-      ? cfg.github.remote.replace(/^https:\/\//, '')
-      : cfg.github.autoCreate ? 'github (creating private repo)' : 'local only';
-  const cloudNote = cfg.cloud?.enabled && cfg.cloud?.name ? ' · cloud: ' + cfg.cloud.name : '';
-  print('\x1b[2mshrey · capturing → ' + destination + cloudNote + ' · dashboard ' + dash + '\x1b[0m');
+  notice('shrey · capturing → ' + destinationLabel(cfg) + ' · dashboard ' + dash);
   if (flags.open) openBrowser(dash);
 
-  // Ctrl+C belongs to Claude Code (it interrupts a response). The proxy must
-  // outlive every Ctrl+C and stop only when Claude Code itself exits.
-  process.on('SIGINT', () => {});
-  let child;
-  // A closed terminal or a kill should still end Claude Code and flush captures.
-  for (const sig of ['SIGTERM', 'SIGHUP']) {
-    process.on(sig, () => child?.kill(sig));
-  }
-  const code = await new Promise((resolve) => {
-    child = spawnClaude(bin, claudeArgs, {
-      cwd: process.cwd(),
-      env: { ...process.env, ANTHROPIC_BASE_URL: started.url, SHREY_ACTIVE: '1' }
-    });
-    child.on('error', (err) => {
-      print('shrey: failed to launch Claude Code: ' + err.message);
-      resolve(1);
-    });
-    child.on('exit', (exitCode) => resolve(exitCode ?? 0));
-  });
+  const code = await runClaude(bin, claudeArgs, { ...process.env, ANTHROPIC_BASE_URL: started.url, SHREY_ACTIVE: '1' });
 
-  print('\x1b[2mshrey · saving captures…\x1b[0m');
+  notice('shrey · saving captures…');
   await started.shutdown();
   unregisterRun();
   const a = started.archiver?.status();
@@ -294,8 +320,185 @@ async function cmdLaunch(cfg, flags, claudeArgs) {
   let summary = 'shrey · ' + sessions + ' session(s) captured';
   if (a?.remote) summary += a.lastError ? ' · push failed: ' + a.lastError : ' · pushed to ' + (a.web ?? a.remote);
   if (c?.enabled) summary += c.lastError ? ' · cloud sync failed: ' + c.lastError : ' · synced to cloud';
-  print('\x1b[2m' + summary + '\x1b[0m');
+  notice(summary);
   process.exit(code);
+}
+
+/**
+ * `shrey --bg ...` (and --background, --tmux): Claude Code starts the session
+ * somewhere else and returns immediately, while that session keeps calling the
+ * API through whatever ANTHROPIC_BASE_URL it inherited. A proxy living in this
+ * process would die with it and strand the session, so the proxy runs as its own
+ * detached process instead, and shuts itself down once no session it could be
+ * serving is still running.
+ */
+async function cmdLaunchDetached(cfg, flags, claudeArgs) {
+  await setupWizard();
+  Object.assign(cfg, loadConfig(overridesFrom(flags)));
+  const upstream = !flags.upstream && inheritedUpstream() ? inheritedUpstream().replace(/\/+$/, '') : null;
+
+  const bin = resolveClaude();
+  if (!bin) return claudeMissing();
+  const notice = makeNotice();
+
+  fs.mkdirSync(RUN_DIR, { recursive: true });
+  const handoff = path.join(RUN_DIR, 'handoff-' + process.pid + '-' + Date.now() + '.json');
+  const [file, args] = selfInvocation(['__proxy-daemon', handoff]);
+  const daemon = spawn(file, args, {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      SHREY_DAEMON_OVERRIDES: JSON.stringify(overridesFrom(flags)),
+      SHREY_DAEMON_UPSTREAM: upstream ?? ''
+    }
+  });
+  daemon.unref();
+
+  const port = await waitForHandoff(handoff, 15000);
+  if (!port) {
+    // Never block the user's command on shrey: run it exactly as `claude` would.
+    notice('shrey · could not start the background proxy; running without capture (see ' + LOG_PATH + ')');
+    process.exit(await runClaude(bin, claudeArgs, process.env));
+  }
+
+  const base = 'http://' + cfg.host + ':' + port;
+  notice('shrey · capturing in the background → ' + destinationLabel(cfg) + ' · dashboard ' + base + DASH_PREFIX + '/');
+  process.exit(await runClaude(bin, claudeArgs, { ...process.env, ANTHROPIC_BASE_URL: base, SHREY_ACTIVE: '1' }));
+}
+
+async function waitForHandoff(file, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const { port } = JSON.parse(fs.readFileSync(file, 'utf8'));
+      fs.rmSync(file, { force: true });
+      if (port) return port;
+    } catch {
+      /* not written yet */
+    }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return null;
+}
+
+/**
+ * The detached proxy behind `shrey --bg`. Lives until Claude Code reports no
+ * session started since this proxy came up, checked via `claude agents --json`,
+ * which lists running sessions whether interactive or background.
+ */
+async function cmdProxyDaemon(cfg, rest) {
+  const handoff = rest[0];
+  const log = logToFile();
+  try {
+    Object.assign(cfg, loadConfig(JSON.parse(process.env.SHREY_DAEMON_OVERRIDES || '{}')));
+  } catch {
+    /* fall back to stored settings */
+  }
+  if (process.env.SHREY_DAEMON_UPSTREAM) cfg.upstream = process.env.SHREY_DAEMON_UPSTREAM;
+  // Leave the well-known port to foreground sessions; any free port will do here.
+  cfg.port = 0;
+
+  const bin = resolveClaude();
+  const startedAt = Date.now();
+  const started = await startServer(cfg, { log, portFallback: true, awaitArchive: false });
+  registerRun({ pid: process.pid, port: cfg.port, url: started.url + DASH_PREFIX + '/', cwd: process.cwd(), startedAt, kind: 'background' });
+  fs.writeFileSync(handoff, JSON.stringify({ port: cfg.port }));
+  log('[shrey] background proxy on ' + started.url);
+
+  const pollMs = Number(process.env.SHREY_DAEMON_POLL_MS) || 30000;
+  const graceMs = Number(process.env.SHREY_DAEMON_GRACE_MS) || 90000;
+  let emptyChecks = 0;
+  let failedChecks = 0;
+
+  const stop = async (why) => {
+    log('[shrey] background proxy stopping: ' + why);
+    await started.shutdown();
+    unregisterRun();
+    process.exit(0);
+  };
+
+  const check = async () => {
+    if (Date.now() - startedAt < graceMs) return;
+    const sessions = bin ? await listClaudeSessions(bin) : null;
+    if (!sessions) {
+      // Can't tell; don't guess it's safe to stop. Give up only if it stays unknowable.
+      if (++failedChecks >= 20) await stop('`claude agents --json` keeps failing');
+      return;
+    }
+    failedChecks = 0;
+    const ours = sessions.filter((s) => (s.startedAt ?? 0) >= startedAt - 15000);
+    emptyChecks = ours.length ? 0 : emptyChecks + 1;
+    // Two in a row, so a session between turns or mid-restart isn't cut off.
+    if (emptyChecks >= 2) await stop('no sessions left');
+  };
+  setInterval(() => check().catch((err) => log('[shrey] session check failed: ' + err.message)), pollMs);
+}
+
+function listClaudeSessions(bin) {
+  return new Promise((resolve) => {
+    const child = spawnClaude(bin, ['agents', '--json'], { stdio: ['ignore', 'pipe', 'ignore'], env: process.env });
+    let out = '';
+    child.stdout.on('data', (d) => { out += d; });
+    child.on('error', () => resolve(null));
+    child.on('exit', (code) => {
+      if (code !== 0) return resolve(null);
+      try {
+        const parsed = JSON.parse(out);
+        resolve(Array.isArray(parsed) ? parsed : null);
+      } catch {
+        resolve(null);
+      }
+    });
+  });
+}
+
+/** How to re-run this same shrey: a packaged shrey.exe is its own entry point. */
+function selfInvocation(args) {
+  let sea = false;
+  try {
+    sea = createRequire(import.meta.url)('node:sea').isSea();
+  } catch {
+    /* node:sea unavailable: definitely not a packaged executable */
+  }
+  return sea ? [process.execPath, args] : [process.execPath, [process.argv[1], ...args]];
+}
+
+/**
+ * Claude Code's management subcommands (`mcp`, `update`, `install`, `agents`, ...)
+ * run exactly as `claude` would: same arguments, same terminal, same exit code, no
+ * proxy and no setup prompt, since none of them runs a model session.
+ */
+async function cmdPassthrough(args) {
+  const bin = resolveClaude();
+  if (!bin) return claudeMissing();
+  process.exit(await runClaude(bin, args, process.env));
+}
+
+/** shrey's own help, then Claude Code's - every Claude Code option works here too. */
+async function cmdHelp() {
+  process.stdout.write(HELP + '\n');
+  const bin = resolveClaude();
+  if (!bin) return;
+  process.stdout.write('CLAUDE CODE OPTIONS (all of these work with shrey too)\n\n');
+  await new Promise((resolve) => {
+    const child = spawnClaude(bin, ['--help'], { stdio: 'inherit', env: process.env });
+    child.on('exit', resolve);
+    child.on('error', resolve);
+  });
+}
+
+async function cmdVersion() {
+  process.stdout.write(VERSION + ' (shrey)\n');
+  const bin = resolveClaude();
+  if (!bin) return;
+  await new Promise((resolve) => {
+    const child = spawnClaude(bin, ['--version'], { stdio: 'inherit', env: process.env });
+    child.on('exit', resolve);
+    child.on('error', resolve);
+  });
 }
 
 /**
@@ -309,11 +512,11 @@ function spawnClaude(bin, args, opts) {
     const line = [bin, ...args].map(quote).join(' ');
     return spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', '"' + line + '"'], {
       ...opts,
-      stdio: 'inherit',
+      windowsHide: true,
       windowsVerbatimArguments: true
     });
   }
-  return spawn(bin, args, { ...opts, stdio: 'inherit' });
+  return spawn(bin, args, { ...opts, windowsHide: true });
 }
 
 function resolveClaude() {
@@ -417,7 +620,10 @@ async function cmdGithub(cfg, rest) {
  *   shrey cloud off                stop reporting
  *   shrey cloud <url> <key>        report to a self-hosted dashboard instead
  */
-async function cmdCloud(cfg, rest, flags) {
+async function cmdCloud(cfg, rawRest, flags) {
+  const taken = takeNameFlag(rawRest);
+  const rest = taken.args;
+  flags = { ...flags, name: taken.name };
   const [first, second] = rest;
   const stored = readStoredConfig();
 
@@ -581,7 +787,7 @@ function cmdInstall(cfg, flags) {
   settings.env = { ...(settings.env ?? {}), ANTHROPIC_BASE_URL: target };
   writeSettings(settings);
   console.log('Claude Code will now always use ' + target + ' (written to ' + CLAUDE_SETTINGS + ').');
-  console.log('It then needs "shrey serve --port ' + cfg.port + '" running. Undo with: shrey uninstall');
+  console.log('It then needs "shrey serve --port ' + cfg.port + '" running. Undo with: shrey proxy-uninstall');
   if (flags.global && process.platform === 'win32') {
     execFile('setx', ['ANTHROPIC_BASE_URL', target], { windowsHide: true }, () => {});
   }
@@ -615,15 +821,19 @@ function openBrowser(target) {
 // ----------------------------------------------------------------------- main
 
 async function main() {
-  const { flags, command, rest } = parseArgs(process.argv.slice(2));
-  if (flags.help || command === 'help') return console.log(HELP);
-  if (flags.version) return console.log(VERSION);
+  const { flags, command, rest, passthrough, detaching } = parseArgs(process.argv.slice(2));
+  // Checked before -h/-v: in `shrey mcp --help` the --help is Claude's.
+  if (passthrough) return cmdPassthrough(passthrough);
+  if (flags.help || command === 'help') return cmdHelp();
+  if (flags.version) return cmdVersion();
 
   const cfg = loadConfig(overridesFrom(flags));
 
   switch (command) {
     case null:
-      return cmdLaunch(cfg, flags, rest);
+      return detaching ? cmdLaunchDetached(cfg, flags, rest) : cmdLaunch(cfg, flags, rest);
+    case '__proxy-daemon':
+      return cmdProxyDaemon(cfg, rest);
     case 'setup':
       await setupWizard({ force: true });
       return console.log('Saved to ' + CONFIG_PATH);
@@ -639,9 +849,9 @@ async function main() {
       return cmdStatus(cfg);
     case 'push':
       return cmdPush(cfg);
-    case 'install':
+    case 'proxy-install':
       return cmdInstall(cfg, flags);
-    case 'uninstall':
+    case 'proxy-uninstall':
       return cmdUninstall(flags);
     default:
       return undefined;

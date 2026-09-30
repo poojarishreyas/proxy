@@ -60,11 +60,20 @@ shrey cloud                                          # show current status
 
 ## Everyday use
 
+**`shrey` is `claude` with capture.** Anything you would type after `claude` works
+after `shrey` and behaves the same — same flags, same prompts, same subcommands, same
+exit codes, and stdout is exactly Claude Code's (shrey's own status lines go to
+stderr, so `shrey -p ... --output-format json | jq` works).
+
 | you type | what happens |
 | --- | --- |
 | `shrey` | Claude Code opens here; everything is captured |
-| `shrey --resume` | any Claude Code argument passes straight through |
-| `shrey -p "explain this repo"` | including non-interactive prompts |
+| `shrey --resume`, `shrey -c`, `shrey -r <id>` | resume / continue, captured |
+| `shrey -p "explain this repo"` | non-interactive prompts, captured |
+| `shrey --model …`, `--name …`, `--add-dir …`, … | every Claude Code flag passes straight through |
+| `shrey --bg "fix the tests"` | background session; a detached proxy keeps capturing it after the command returns, and exits by itself once the session is stopped |
+| `shrey mcp …`, `shrey update`, `shrey install`, `shrey agents`, `shrey stop <id>`, … | Claude Code's management commands run exactly as `claude …` — no proxy, no banner |
+| `shrey --version`, `shrey --help` | shrey's, followed by Claude Code's |
 | `shrey dashboard` | open the live local trajectory view of a running shrey |
 | `shrey status` | settings, session count, token totals, running instances |
 | `shrey push` | commit and push to GitHub now instead of waiting |
